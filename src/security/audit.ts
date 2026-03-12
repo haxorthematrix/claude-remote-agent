@@ -3,6 +3,7 @@ import * as path from "path";
 import * as os from "os";
 import * as crypto from "crypto";
 import { GlobalConfig } from "../types/index.js";
+import { OutputSanitizer, SanitizerConfig } from "./sanitizer.js";
 
 export interface AuditLogEntry {
   timestamp: string;
@@ -27,8 +28,9 @@ export class AuditLogger {
   private maxOutputLogged: number;
   private sessionId: string;
   private initialized: boolean = false;
+  private sanitizer: OutputSanitizer;
 
-  constructor(config?: GlobalConfig["audit"]) {
+  constructor(config?: GlobalConfig["audit"], sanitizerConfig?: Partial<SanitizerConfig>) {
     const auditConfig = config || {
       enabled: true,
       log_path: "~/.config/claude-remote-agent/audit.log",
@@ -43,6 +45,7 @@ export class AuditLogger {
     this.logOutput = auditConfig.log_output;
     this.maxOutputLogged = auditConfig.max_output_logged;
     this.sessionId = this.generateSessionId();
+    this.sanitizer = new OutputSanitizer(sanitizerConfig);
   }
 
   /**
@@ -82,13 +85,16 @@ export class AuditLogger {
       return;
     }
 
+    // Sanitize the command (may contain passwords in arguments)
+    const sanitizedCommand = this.sanitizer.sanitize(params.command);
+
     const entry: AuditLogEntry = {
       timestamp: new Date().toISOString(),
       session_id: this.sessionId,
       tool: "remote_execute",
       host: params.host,
       user: params.user,
-      action: params.command,
+      action: sanitizedCommand.output,
       exit_code: params.exit_code,
       duration_ms: params.duration_ms,
       success: params.exit_code === 0,
@@ -97,18 +103,38 @@ export class AuditLogger {
       },
     };
 
+    // Track if any secrets were redacted
+    if (sanitizedCommand.redaction_count > 0) {
+      entry.details = {
+        ...entry.details,
+        secrets_redacted: sanitizedCommand.redaction_count,
+        secret_types: sanitizedCommand.detected_types,
+      };
+    }
+
     // Add output hash if logging output
     if (this.logOutput && (params.stdout || params.stderr)) {
       const output = (params.stdout || "") + (params.stderr || "");
       entry.output_hash = this.hashOutput(output);
 
-      // Truncate output for details
+      // Sanitize and truncate output for details
       if (output.length > 0) {
+        const sanitizedOutput = this.sanitizer.sanitize(
+          output.substring(0, Math.min(500, this.maxOutputLogged))
+        );
         entry.details = {
           ...entry.details,
-          output_preview: output.substring(0, Math.min(500, this.maxOutputLogged)),
+          output_preview: sanitizedOutput.output,
           output_length: output.length,
         };
+
+        // Track output secrets separately
+        if (sanitizedOutput.redaction_count > 0) {
+          entry.details = {
+            ...entry.details,
+            output_secrets_redacted: sanitizedOutput.redaction_count,
+          };
+        }
       }
     }
 
@@ -165,18 +191,31 @@ export class AuditLogger {
       return;
     }
 
+    // Sanitize the command if present
+    let action = params.command || params.action;
+    let secretsRedacted = 0;
+    if (params.command) {
+      const sanitized = this.sanitizer.sanitize(params.command);
+      action = sanitized.output;
+      secretsRedacted = sanitized.redaction_count;
+    }
+
     const entry: AuditLogEntry = {
       timestamp: new Date().toISOString(),
       session_id: params.session_id,
       tool: `remote_session_${params.action}`,
       host: params.host,
       user: params.user,
-      action: params.command || params.action,
+      action,
       exit_code: params.exit_code,
       duration_ms: params.duration_ms,
       success: params.success,
       error: params.error,
     };
+
+    if (secretsRedacted > 0) {
+      entry.details = { secrets_redacted: secretsRedacted };
+    }
 
     this.writeEntry(entry);
   }
@@ -265,6 +304,13 @@ export class AuditLogger {
   }
 
   /**
+   * Get the output sanitizer
+   */
+  getSanitizer(): OutputSanitizer {
+    return this.sanitizer;
+  }
+
+  /**
    * Read recent audit entries
    */
   readRecentEntries(count: number = 100): AuditLogEntry[] {
@@ -341,9 +387,12 @@ let auditLogger: AuditLogger | null = null;
 /**
  * Get or create the audit logger instance
  */
-export function getAuditLogger(config?: GlobalConfig["audit"]): AuditLogger {
+export function getAuditLogger(
+  config?: GlobalConfig["audit"],
+  sanitizerConfig?: Partial<SanitizerConfig>
+): AuditLogger {
   if (!auditLogger) {
-    auditLogger = new AuditLogger(config);
+    auditLogger = new AuditLogger(config, sanitizerConfig);
   }
   return auditLogger;
 }
@@ -351,8 +400,11 @@ export function getAuditLogger(config?: GlobalConfig["audit"]): AuditLogger {
 /**
  * Initialize the audit logger with config
  */
-export function initAuditLogger(config: GlobalConfig["audit"]): AuditLogger {
-  auditLogger = new AuditLogger(config);
+export function initAuditLogger(
+  config: GlobalConfig["audit"],
+  sanitizerConfig?: Partial<SanitizerConfig>
+): AuditLogger {
+  auditLogger = new AuditLogger(config, sanitizerConfig);
   auditLogger.initialize();
   return auditLogger;
 }
