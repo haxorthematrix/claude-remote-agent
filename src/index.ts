@@ -9,6 +9,7 @@ import {
 import { getConfigLoader, ConfigLoader } from "./config/loader.js";
 import { SSHConnection } from "./ssh/connection.js";
 import { policyEngine, logSkipPermissionsWarning } from "./security/policy.js";
+import { initAuditLogger, getAuditLogger, AuditLogger } from "./security/audit.js";
 import {
   parseSSHConfig,
   getSSHAlias,
@@ -472,6 +473,33 @@ const TOOLS: Tool[] = [
       required: [],
     },
   },
+  {
+    name: "audit_log_query",
+    description:
+      "Query the audit log to see recent remote operations. Useful for reviewing what commands have been executed.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        count: {
+          type: "number",
+          description: "Number of recent entries to retrieve (default: 20, max: 100)",
+        },
+        host: {
+          type: "string",
+          description: "Filter by host name",
+        },
+        tool: {
+          type: "string",
+          description: "Filter by tool name (e.g., 'remote_execute', 'remote_file_write')",
+        },
+        success_only: {
+          type: "boolean",
+          description: "Only show successful operations",
+        },
+      },
+      required: [],
+    },
+  },
 ];
 
 export async function createServer(configDir?: string): Promise<Server> {
@@ -481,6 +509,13 @@ export async function createServer(configDir?: string): Promise<Server> {
   // Load configuration
   const configLoader = getConfigLoader(configDir);
   await configLoader.load();
+
+  // Initialize audit logger
+  const globalConfig = configLoader.getGlobalConfig();
+  const auditLogger = initAuditLogger(globalConfig.audit);
+  if (auditLogger.isEnabled()) {
+    console.error(`[claude-remote-agent] Audit logging enabled: ${auditLogger.getLogPath()}`);
+  }
 
   const server = new Server(
     {
@@ -550,7 +585,7 @@ export async function createServer(configDir?: string): Promise<Server> {
           return await handleSessionExecute(configLoader, toolArgs as unknown as { session_id: string; command: string; timeout?: number });
 
         case "remote_session_end":
-          return await handleSessionEnd(toolArgs as unknown as { session_id: string });
+          return await handleSessionEnd(configLoader, toolArgs as unknown as { session_id: string });
 
         // SSH Alias Management
         case "ssh_alias_list":
@@ -602,6 +637,14 @@ export async function createServer(configDir?: string): Promise<Server> {
         case "remote_permissions_status":
           return handlePermissionsStatus();
 
+        case "audit_log_query":
+          return handleAuditLogQuery(toolArgs as unknown as {
+            count?: number;
+            host?: string;
+            tool?: string;
+            success_only?: boolean;
+          });
+
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
@@ -624,6 +667,7 @@ async function handleRemoteExecute(
   params: RemoteExecuteParams
 ) {
   const { host, command, timeout, working_dir, env } = params;
+  const auditLogger = getAuditLogger();
 
   // Resolve hosts (could be a group)
   const hostNames = configLoader.resolveHosts(host);
@@ -646,6 +690,14 @@ async function handleRemoteExecute(
     const policyCheck = policyEngine.checkCommand(command, policy);
 
     if (!policyCheck.allowed) {
+      auditLogger.logCommand({
+        host: hostName,
+        user: hostConfig.user,
+        command,
+        exit_code: -1,
+        duration_ms: 0,
+        confirmed_by: "policy",
+      });
       throw new Error(
         `Command blocked on ${hostName}: ${policyCheck.reason}` +
           (policyCheck.blocked_by ? ` (rule: ${policyCheck.blocked_by})` : "")
@@ -664,6 +716,18 @@ async function handleRemoteExecute(
       timeout: timeout ? timeout * 1000 : undefined,
       working_dir,
       env,
+    });
+
+    // Audit log the command execution
+    auditLogger.logCommand({
+      host: hostName,
+      user: hostConfig.user,
+      command,
+      exit_code: result.exit_code,
+      duration_ms: result.duration_ms,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      confirmed_by: policyEngine.isSkipPermissionsMode() ? "skip-permissions" : "policy",
     });
 
     results.push({
@@ -697,6 +761,7 @@ async function handleRemoteFileRead(
   params: RemoteFileReadParams
 ) {
   const { host, path: filePath, offset, limit } = params;
+  const auditLogger = getAuditLogger();
 
   const hostConfig = configLoader.getHost(host);
   if (!hostConfig) {
@@ -709,7 +774,30 @@ async function handleRemoteFileRead(
     connectionPool.set(host, connection);
   }
 
-  const content = await connection.readFile(filePath);
+  let content: string;
+  try {
+    content = await connection.readFile(filePath);
+    auditLogger.logFileOperation({
+      tool: "remote_file_read",
+      host,
+      user: hostConfig.user,
+      path: filePath,
+      operation: "read",
+      success: true,
+      details: { offset, limit, size: content.length },
+    });
+  } catch (error) {
+    auditLogger.logFileOperation({
+      tool: "remote_file_read",
+      host,
+      user: hostConfig.user,
+      path: filePath,
+      operation: "read",
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 
   // Apply offset and limit
   let lines = content.split("\n");
@@ -736,6 +824,7 @@ async function handleRemoteFileWrite(
   params: RemoteFileWriteParams
 ) {
   const { host, path: filePath, content, mode, backup } = params;
+  const auditLogger = getAuditLogger();
 
   const hostConfig = configLoader.getHost(host);
   if (!hostConfig) {
@@ -745,6 +834,15 @@ async function handleRemoteFileWrite(
   // Check policy for write operations
   const policy = configLoader.getEffectivePolicy(host);
   if (policy.read_only) {
+    auditLogger.logFileOperation({
+      tool: "remote_file_write",
+      host,
+      user: hostConfig.user,
+      path: filePath,
+      operation: "write",
+      success: false,
+      error: "Host is in read-only mode",
+    });
     throw new Error(`Host ${host} is in read-only mode`);
   }
 
@@ -764,8 +862,30 @@ async function handleRemoteFileWrite(
     }
   }
 
-  const modeNum = mode ? parseInt(mode, 8) : undefined;
-  await connection.writeFile(filePath, content, { mode: modeNum });
+  try {
+    const modeNum = mode ? parseInt(mode, 8) : undefined;
+    await connection.writeFile(filePath, content, { mode: modeNum });
+    auditLogger.logFileOperation({
+      tool: "remote_file_write",
+      host,
+      user: hostConfig.user,
+      path: filePath,
+      operation: "write",
+      success: true,
+      details: { size: content.length, mode, backup },
+    });
+  } catch (error) {
+    auditLogger.logFileOperation({
+      tool: "remote_file_write",
+      host,
+      user: hostConfig.user,
+      path: filePath,
+      operation: "write",
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 
   return {
     content: [{ type: "text", text: `File written successfully: ${filePath}` }],
@@ -783,6 +903,7 @@ async function handleRemoteFileEdit(
   }
 ) {
   const { host, path: filePath, old_string, new_string, replace_all } = params;
+  const auditLogger = getAuditLogger();
 
   const hostConfig = configLoader.getHost(host);
   if (!hostConfig) {
@@ -792,6 +913,15 @@ async function handleRemoteFileEdit(
   // Check policy for write operations
   const policy = configLoader.getEffectivePolicy(host);
   if (policy.read_only) {
+    auditLogger.logFileOperation({
+      tool: "remote_file_edit",
+      host,
+      user: hostConfig.user,
+      path: filePath,
+      operation: "edit",
+      success: false,
+      error: "Host is in read-only mode",
+    });
     throw new Error(`Host ${host} is in read-only mode`);
   }
 
@@ -806,6 +936,15 @@ async function handleRemoteFileEdit(
 
   // Check if old_string exists
   if (!content.includes(old_string)) {
+    auditLogger.logFileOperation({
+      tool: "remote_file_edit",
+      host,
+      user: hostConfig.user,
+      path: filePath,
+      operation: "edit",
+      success: false,
+      error: "Text not found in file",
+    });
     throw new Error(
       `Could not find the specified text in ${filePath}. ` +
       `Make sure the old_string matches exactly (including whitespace).`
@@ -813,14 +952,21 @@ async function handleRemoteFileEdit(
   }
 
   // Check for uniqueness if not replacing all
-  if (!replace_all) {
-    const occurrences = content.split(old_string).length - 1;
-    if (occurrences > 1) {
-      throw new Error(
-        `Found ${occurrences} occurrences of the specified text. ` +
-        `Either use replace_all: true, or provide more context to make the match unique.`
-      );
-    }
+  const occurrences = content.split(old_string).length - 1;
+  if (!replace_all && occurrences > 1) {
+    auditLogger.logFileOperation({
+      tool: "remote_file_edit",
+      host,
+      user: hostConfig.user,
+      path: filePath,
+      operation: "edit",
+      success: false,
+      error: `Multiple occurrences found (${occurrences})`,
+    });
+    throw new Error(
+      `Found ${occurrences} occurrences of the specified text. ` +
+      `Either use replace_all: true, or provide more context to make the match unique.`
+    );
   }
 
   // Perform replacement
@@ -834,7 +980,17 @@ async function handleRemoteFileEdit(
   // Write back
   await connection.writeFile(filePath, newContent);
 
-  const replacements = replace_all ? content.split(old_string).length - 1 : 1;
+  const replacements = replace_all ? occurrences : 1;
+  auditLogger.logFileOperation({
+    tool: "remote_file_edit",
+    host,
+    user: hostConfig.user,
+    path: filePath,
+    operation: "edit",
+    success: true,
+    details: { replacements, replace_all },
+  });
+
   return {
     content: [
       {
@@ -856,6 +1012,7 @@ async function handleRemoteUpload(
   }
 ) {
   const { host, local_path, remote_path, mode } = params;
+  const auditLogger = getAuditLogger();
 
   const hostConfig = configLoader.getHost(host);
   if (!hostConfig) {
@@ -865,6 +1022,15 @@ async function handleRemoteUpload(
   // Check policy for write operations
   const policy = configLoader.getEffectivePolicy(host);
   if (policy.read_only) {
+    auditLogger.logFileOperation({
+      tool: "remote_upload",
+      host,
+      user: hostConfig.user,
+      path: remote_path,
+      operation: "upload",
+      success: false,
+      error: "Host is in read-only mode",
+    });
     throw new Error(`Host ${host} is in read-only mode`);
   }
 
@@ -874,13 +1040,36 @@ async function handleRemoteUpload(
     connectionPool.set(host, connection);
   }
 
-  const modeNum = mode ? parseInt(mode, 8) : undefined;
-  await connection.uploadFile(local_path, remote_path, { mode: modeNum });
-
   // Get file size for confirmation
   const fs = await import("fs");
-  const stats = fs.statSync(local_path.replace(/^~/, process.env.HOME || ""));
+  const expandedPath = local_path.replace(/^~/, process.env.HOME || "");
+  const stats = fs.statSync(expandedPath);
   const sizeKB = (stats.size / 1024).toFixed(2);
+
+  try {
+    const modeNum = mode ? parseInt(mode, 8) : undefined;
+    await connection.uploadFile(local_path, remote_path, { mode: modeNum });
+    auditLogger.logFileOperation({
+      tool: "remote_upload",
+      host,
+      user: hostConfig.user,
+      path: remote_path,
+      operation: "upload",
+      success: true,
+      details: { local_path, size: stats.size, mode },
+    });
+  } catch (error) {
+    auditLogger.logFileOperation({
+      tool: "remote_upload",
+      host,
+      user: hostConfig.user,
+      path: remote_path,
+      operation: "upload",
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 
   return {
     content: [
@@ -904,6 +1093,7 @@ async function handleRemoteDownload(
   }
 ) {
   const { host, remote_path, local_path } = params;
+  const auditLogger = getAuditLogger();
 
   const hostConfig = configLoader.getHost(host);
   if (!hostConfig) {
@@ -919,10 +1109,41 @@ async function handleRemoteDownload(
   // Get remote file stats first
   const remoteStats = await connection.stat(remote_path);
   if (remoteStats.isDirectory) {
+    auditLogger.logFileOperation({
+      tool: "remote_download",
+      host,
+      user: hostConfig.user,
+      path: remote_path,
+      operation: "download",
+      success: false,
+      error: "Path is a directory",
+    });
     throw new Error(`${remote_path} is a directory. Only files can be downloaded.`);
   }
 
-  await connection.downloadFile(remote_path, local_path);
+  try {
+    await connection.downloadFile(remote_path, local_path);
+    auditLogger.logFileOperation({
+      tool: "remote_download",
+      host,
+      user: hostConfig.user,
+      path: remote_path,
+      operation: "download",
+      success: true,
+      details: { local_path, size: remoteStats.size },
+    });
+  } catch (error) {
+    auditLogger.logFileOperation({
+      tool: "remote_download",
+      host,
+      user: hostConfig.user,
+      path: remote_path,
+      operation: "download",
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 
   const sizeKB = (remoteStats.size / 1024).toFixed(2);
 
@@ -970,6 +1191,7 @@ async function handleSessionStart(
   params: { host: string; working_dir?: string; env?: Record<string, string> }
 ) {
   const { host, working_dir, env } = params;
+  const auditLogger = getAuditLogger();
 
   const hostConfig = configLoader.getHost(host);
   if (!hostConfig) {
@@ -990,6 +1212,14 @@ async function handleSessionStart(
     createdAt: new Date(),
   });
 
+  auditLogger.logSession({
+    action: "start",
+    session_id: sessionId,
+    host,
+    user: hostConfig.user,
+    success: true,
+  });
+
   return {
     content: [
       {
@@ -1005,17 +1235,30 @@ async function handleSessionExecute(
   params: { session_id: string; command: string; timeout?: number }
 ) {
   const { session_id, command, timeout } = params;
+  const auditLogger = getAuditLogger();
 
   const session = sessions.get(session_id);
   if (!session) {
     throw new Error(`Unknown session: ${session_id}`);
   }
 
+  const hostConfig = configLoader.getHost(session.host);
+
   // Check policy
   const policy = configLoader.getEffectivePolicy(session.host);
   const policyCheck = policyEngine.checkCommand(command, policy);
 
   if (!policyCheck.allowed) {
+    auditLogger.logSession({
+      action: "execute",
+      session_id,
+      host: session.host,
+      user: hostConfig?.user || "unknown",
+      command,
+      exit_code: -1,
+      success: false,
+      error: policyCheck.reason,
+    });
     throw new Error(`Command blocked: ${policyCheck.reason}`);
   }
 
@@ -1025,6 +1268,17 @@ async function handleSessionExecute(
     env: session.env,
   });
 
+  auditLogger.logSession({
+    action: "execute",
+    session_id,
+    host: session.host,
+    user: hostConfig?.user || "unknown",
+    command,
+    exit_code: result.exit_code,
+    duration_ms: result.duration_ms,
+    success: result.exit_code === 0,
+  });
+
   let output = `Exit code: ${result.exit_code}\nDuration: ${result.duration_ms}ms`;
   if (result.stdout) output += `\n\nSTDOUT:\n${result.stdout}`;
   if (result.stderr) output += `\n\nSTDERR:\n${result.stderr}`;
@@ -1032,16 +1286,30 @@ async function handleSessionExecute(
   return { content: [{ type: "text", text: output }] };
 }
 
-async function handleSessionEnd(params: { session_id: string }) {
+async function handleSessionEnd(
+  configLoader: ConfigLoader,
+  params: { session_id: string }
+) {
   const { session_id } = params;
+  const auditLogger = getAuditLogger();
 
   const session = sessions.get(session_id);
   if (!session) {
     throw new Error(`Unknown session: ${session_id}`);
   }
 
+  const hostConfig = configLoader.getHost(session.host);
+
   session.connection.disconnect();
   sessions.delete(session_id);
+
+  auditLogger.logSession({
+    action: "end",
+    session_id,
+    host: session.host,
+    user: hostConfig?.user || "unknown",
+    success: true,
+  });
 
   return {
     content: [{ type: "text", text: `Session ended: ${session_id}` }],
@@ -1173,6 +1441,7 @@ async function handleRemoteInstallAgent(
   }
 ) {
   const { host, install_node, node_version, install_dir, create_service } = params;
+  const auditLogger = getAuditLogger();
 
   const hostConfig = configLoader.getHost(host);
   if (!hostConfig) {
@@ -1199,6 +1468,16 @@ async function handleRemoteInstallAgent(
   );
 
   connection.disconnect();
+
+  // Log installation to audit
+  auditLogger.logInstallation({
+    host,
+    user: hostConfig.user,
+    success: result.success,
+    steps: result.steps,
+    error: result.success ? undefined : result.message,
+    os_type: result.osType,
+  });
 
   let output = result.success
     ? `Installation successful on ${host}!\n\n`
@@ -1385,6 +1664,79 @@ function handlePermissionsStatus() {
   output += `  CLAUDE_SKIP_PERMISSIONS: ${process.env.CLAUDE_SKIP_PERMISSIONS || "(not set)"}\n`;
   output += `  CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS: ${process.env.CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS || "(not set)"}\n`;
   output += `  CRA_SKIP_CONFIRMATIONS: ${process.env.CRA_SKIP_CONFIRMATIONS || "(not set)"}\n`;
+
+  return {
+    content: [{ type: "text", text: output }],
+  };
+}
+
+function handleAuditLogQuery(params: {
+  count?: number;
+  host?: string;
+  tool?: string;
+  success_only?: boolean;
+}) {
+  const auditLogger = getAuditLogger();
+
+  if (!auditLogger.isEnabled()) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Audit logging is disabled. Enable it in config.yaml:\n\n" +
+            "global:\n  audit:\n    enabled: true",
+        },
+      ],
+    };
+  }
+
+  const count = Math.min(params.count || 20, 100);
+  let entries = auditLogger.readRecentEntries(count * 2); // Get extra for filtering
+
+  // Apply filters
+  if (params.host) {
+    entries = entries.filter((e) => e.host === params.host);
+  }
+  if (params.tool) {
+    entries = entries.filter((e) => e.tool === params.tool);
+  }
+  if (params.success_only) {
+    entries = entries.filter((e) => e.success);
+  }
+
+  // Limit to requested count
+  entries = entries.slice(-count);
+
+  if (entries.length === 0) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: "No audit log entries found matching the criteria.\n" +
+            `Log file: ${auditLogger.getLogPath()}`,
+        },
+      ],
+    };
+  }
+
+  // Format output
+  const lines = entries.map((entry) => {
+    const status = entry.success ? "✓" : "✗";
+    const time = entry.timestamp.replace("T", " ").replace(/\.\d+Z$/, "");
+    let line = `[${time}] ${status} ${entry.tool}`;
+    if (entry.host) line += ` @ ${entry.host}`;
+    line += `\n  Action: ${entry.action}`;
+    if (entry.exit_code !== undefined) line += `\n  Exit: ${entry.exit_code}`;
+    if (entry.duration_ms !== undefined) line += ` (${entry.duration_ms}ms)`;
+    if (entry.error) line += `\n  Error: ${entry.error}`;
+    return line;
+  });
+
+  let output = `Audit Log (${entries.length} entries)\n`;
+  output += `Session: ${auditLogger.getSessionId()}\n`;
+  output += `Log file: ${auditLogger.getLogPath()}\n`;
+  output += "─".repeat(50) + "\n\n";
+  output += lines.join("\n\n");
 
   return {
     content: [{ type: "text", text: output }],

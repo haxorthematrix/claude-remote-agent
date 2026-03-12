@@ -67,6 +67,13 @@ export class ConfigLoader {
   }
 
   /**
+   * Get global configuration
+   */
+  getGlobalConfig(): GlobalConfig {
+    return this.getConfig().global;
+  }
+
+  /**
    * Get host configuration by name
    */
   getHost(name: string): HostConfig | undefined {
