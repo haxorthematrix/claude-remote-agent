@@ -70,8 +70,8 @@ Manages:
 Enforces:
 - Command allowlists/blocklists
 - Confirmation requirements
-- Audit logging
-- Rate limiting
+- Audit logging with output sanitization
+- Automatic secret redaction (passwords, API keys, tokens)
 
 ---
 
@@ -553,6 +553,97 @@ Check current permissions mode (normal vs skip-permissions).
 // - What safeguards remain active
 ```
 
+### 20. `remote_host_info`
+
+Get detailed information about a specific host configuration.
+
+```typescript
+interface RemoteHostInfoParams {
+  host: string;  // Host name from config
+}
+
+interface RemoteHostInfoResult {
+  name: string;
+  hostname: string;
+  port: number;
+  user: string;
+  auth_type: string;
+  policy: PolicyConfig;
+  labels?: Record<string, string>;
+  proxy_jump?: string;
+}
+```
+
+### 21. `remote_check_policy`
+
+Check if a command would be allowed by a host's security policy.
+
+```typescript
+interface RemoteCheckPolicyParams {
+  host: string;
+  command: string;
+}
+
+interface RemoteCheckPolicyResult {
+  allowed: boolean;
+  requires_confirmation: boolean;
+  blocked_by?: string;  // Rule that blocked it
+  reason?: string;
+}
+```
+
+### 22. `remote_session_list`
+
+List all active remote sessions.
+
+```typescript
+// No parameters required
+interface RemoteSessionListResult {
+  sessions: Array<{
+    session_id: string;
+    host: string;
+    user: string;
+    started_at: string;
+    last_command?: string;
+  }>;
+}
+```
+
+### 23. `config_reload`
+
+Reload configuration from disk without restarting the server.
+
+```typescript
+interface ConfigReloadParams {
+  force?: boolean;  // Force reload even if no changes detected
+}
+
+interface ConfigReloadResult {
+  success: boolean;
+  hosts_loaded: number;
+  groups_loaded: number;
+  hot_reload_enabled: boolean;
+}
+```
+
+### 24. `audit_log_query`
+
+Query the audit log for recent operations.
+
+```typescript
+interface AuditLogQueryParams {
+  count?: number;       // Number of entries (default: 50)
+  host?: string;        // Filter by host
+  tool?: string;        // Filter by tool name
+  success_only?: boolean;
+}
+
+interface AuditLogQueryResult {
+  entries: AuditLogEntry[];
+  total_count: number;
+}
+```
+
 ---
 
 ## Security Model
@@ -645,7 +736,7 @@ Use the `remote_permissions_status` tool to check current mode.
 
 ### Audit Trail
 
-All remote operations are logged:
+All remote operations are logged with automatic secret redaction:
 
 ```json
 {
@@ -657,9 +748,23 @@ All remote operations are logged:
   "exit_code": 0,
   "duration_ms": 245,
   "confirmed_by": "user",
-  "output_hash": "sha256:abc123..."
+  "output_hash": "sha256:abc123...",
+  "details": {
+    "secrets_redacted": 0,
+    "output_preview": "● nginx.service - A high performance web server..."
+  }
 }
 ```
+
+**Automatic Redaction**: The following sensitive data is automatically redacted in logs:
+- Passwords and passphrases (in commands and output)
+- API keys and Bearer tokens
+- AWS credentials (access keys, secret keys)
+- Private keys (RSA, DSA, EC, OpenSSH)
+- JWT tokens
+- Database connection strings with credentials
+- GitHub/GitLab/Slack tokens
+- Environment variable exports containing secrets
 
 ---
 
@@ -696,7 +801,8 @@ claude-remote-agent/
 │   ├── security/
 │   │   ├── policy.ts         # Policy evaluation
 │   │   ├── matcher.ts        # Command pattern matching
-│   │   └── audit.ts          # Audit logging
+│   │   ├── audit.ts          # Audit logging
+│   │   └── sanitizer.ts      # Output sanitization (secret redaction)
 │   └── types/
 │       └── index.ts          # TypeScript type definitions
 ├── config/
@@ -988,22 +1094,40 @@ interface PolicyViolation {
 
 ---
 
-## Future Enhancements
+## Implementation Status
 
-### Phase 2
+### Core Features (Completed)
+- [x] All 19+ MCP tools implemented
+- [x] SSH connection management with connection pooling
+- [x] Proxy jump / bastion host connections
+- [x] Per-host security policies (allowlists, blocklists, confirmation levels)
+- [x] Audit logging with session tracking
+- [x] Output sanitization (automatic secret redaction)
+- [x] Config hot-reload (file watching)
+- [x] Multi-platform support (Linux, macOS, Windows)
+- [x] SFTP file operations (read, write, edit, upload, download)
+- [x] Interactive session management
+- [x] SSH alias management (~/.ssh/config)
+- [x] Remote agent installation
+- [x] System detection (OS, package manager, init system)
+- [x] Skip-permissions mode support
+
+### Future Enhancements
+
+#### Phase 2
 - [x] ~~Windows SSH support~~ (Completed)
 - [ ] Windows Remote Management (WinRM) as alternative to SSH
 - [ ] Docker container execution (without SSH)
 - [ ] Kubernetes pod execution
 - [ ] AWS SSM Session Manager integration
 
-### Phase 3
+#### Phase 3
 - [ ] Ansible playbook execution
 - [ ] Terraform integration
 - [ ] Multi-host orchestration workflows
 - [ ] Scheduled/recurring commands
 
-### Phase 4
+#### Phase 4
 - [ ] Web UI for configuration management
 - [ ] Centralized audit dashboard
 - [ ] Team/role-based access control
@@ -1019,9 +1143,9 @@ interface PolicyViolation {
 
 3. **Privilege Escalation**: sudo commands should be explicitly configured and logged. Consider requiring MFA for privileged operations.
 
-4. **Session Isolation**: Each Claude session should have isolated connection contexts to prevent cross-session leakage.
+4. **Session Isolation**: Each Claude session has isolated connection contexts with unique session IDs to prevent cross-session leakage. ✓ Implemented
 
-5. **Output Sanitization**: Sensitive data in command output (passwords, tokens) should be detected and redacted in logs.
+5. **Output Sanitization**: Sensitive data in command output (passwords, tokens, API keys, private keys) is automatically detected and redacted in audit logs. ✓ Implemented
 
 ### Windows-Specific Security
 
