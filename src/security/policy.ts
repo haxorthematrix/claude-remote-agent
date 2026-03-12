@@ -36,6 +36,7 @@ export function logSkipPermissionsWarning(): void {
 
 // Commands considered "destructive"
 const DESTRUCTIVE_COMMANDS = [
+  // Common Unix
   "rm",
   "rmdir",
   "kill",
@@ -46,23 +47,42 @@ const DESTRUCTIVE_COMMANDS = [
   "halt",
   "poweroff",
   "init",
+
+  // Linux systemd/service
   "systemctl stop",
   "systemctl restart",
   "systemctl disable",
   "service stop",
   "service restart",
+
+  // macOS launchctl
+  "launchctl unload",
+  "launchctl remove",
+  "launchctl kill",
+
+  // Docker
   "docker rm",
   "docker stop",
   "docker kill",
+
+  // Kubernetes
   "kubectl delete",
+
+  // Database
   "drop database",
   "drop table",
   "truncate",
+
+  // macOS specific
+  "diskutil eraseDisk",
+  "diskutil eraseVolume",
+  "tmutil delete",
 ];
 
 // Commands considered "write" operations
 const WRITE_COMMANDS = [
   ...DESTRUCTIVE_COMMANDS,
+  // Common Unix
   "mv",
   "cp",
   "touch",
@@ -72,26 +92,59 @@ const WRITE_COMMANDS = [
   "chgrp",
   "ln",
   "install",
+
+  // Linux package managers
   "apt-get install",
   "apt install",
   "yum install",
   "dnf install",
   "pacman -S",
+
+  // macOS Homebrew
+  "brew install",
+  "brew uninstall",
+  "brew upgrade",
+  "brew link",
+  "brew unlink",
+
+  // Common package managers
   "npm install",
   "pip install",
+
+  // Linux systemd
   "systemctl start",
   "systemctl enable",
   "service start",
+
+  // macOS launchctl
+  "launchctl load",
+  "launchctl bootstrap",
+  "launchctl enable",
+
+  // Docker
   "docker run",
   "docker create",
+
+  // Kubernetes
   "kubectl apply",
   "kubectl create",
+
+  // Database
   "insert into",
   "update",
   "delete from",
+
+  // Git
   "git push",
   "git commit",
   "git merge",
+
+  // macOS specific
+  "defaults write",
+  "scutil --set",
+  "networksetup",
+  "tmutil",
+  "softwareupdate --install",
 ];
 
 export interface PolicyCheckResult {

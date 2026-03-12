@@ -1,13 +1,14 @@
 #!/bin/bash
 #
 # Claude Remote Agent - Quick Installation Script
+# Supports: Linux (apt, dnf, yum, pacman, apk) and macOS (Homebrew)
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/your-org/claude-remote-agent/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/haxorthematrix/claude-remote-agent/main/install.sh | bash
 #
 # Options:
 #   --node-version VERSION   Node.js version to install (default: 20)
-#   --install-dir PATH       Installation directory (default: /opt/claude-remote-agent)
+#   --install-dir PATH       Installation directory (default: /opt/claude-remote-agent or /usr/local/opt/claude-remote-agent on macOS)
 #   --no-node               Skip Node.js installation
 #
 
@@ -21,8 +22,9 @@ NC='\033[0m' # No Color
 
 # Default values
 NODE_VERSION="20"
-INSTALL_DIR="/opt/claude-remote-agent"
+INSTALL_DIR=""
 INSTALL_NODE=true
+OS_TYPE=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -52,9 +54,41 @@ echo "║           Claude Remote Agent - Installation              ║"
 echo "╚═══════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
-# Detect OS
+# Detect OS type (Linux vs macOS)
+detect_os_type() {
+    case "$(uname -s)" in
+        Darwin)
+            OS_TYPE="macos"
+            ;;
+        Linux)
+            OS_TYPE="linux"
+            ;;
+        *)
+            OS_TYPE="unknown"
+            ;;
+    esac
+}
+
+# Set default install directory based on OS
+set_default_install_dir() {
+    if [ -z "$INSTALL_DIR" ]; then
+        if [ "$OS_TYPE" = "macos" ]; then
+            INSTALL_DIR="/usr/local/opt/claude-remote-agent"
+        else
+            INSTALL_DIR="/opt/claude-remote-agent"
+        fi
+    fi
+}
+
+# Detect OS details
 detect_os() {
-    if [ -f /etc/os-release ]; then
+    detect_os_type
+    set_default_install_dir
+
+    if [ "$OS_TYPE" = "macos" ]; then
+        OS=$(sw_vers -productName 2>/dev/null || echo "macOS")
+        VERSION=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
+    elif [ -f /etc/os-release ]; then
         . /etc/os-release
         OS=$ID
         VERSION=$VERSION_ID
@@ -63,12 +97,27 @@ detect_os() {
         VERSION="unknown"
     fi
     ARCH=$(uname -m)
-    echo -e "${YELLOW}Detected: $OS $VERSION ($ARCH)${NC}"
+    echo -e "${YELLOW}Detected: $OS_TYPE - $OS $VERSION ($ARCH)${NC}"
 }
 
 # Detect package manager
 detect_pkg_manager() {
-    if command -v apt-get &> /dev/null; then
+    if [ "$OS_TYPE" = "macos" ]; then
+        if command -v brew &> /dev/null; then
+            PKG_MANAGER="brew"
+        else
+            PKG_MANAGER="none"
+            echo -e "${YELLOW}Homebrew not found. Installing Homebrew first...${NC}"
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            # Add brew to PATH for this session
+            if [ -f /opt/homebrew/bin/brew ]; then
+                eval "$(/opt/homebrew/bin/brew shellenv)"
+            elif [ -f /usr/local/bin/brew ]; then
+                eval "$(/usr/local/bin/brew shellenv)"
+            fi
+            PKG_MANAGER="brew"
+        fi
+    elif command -v apt-get &> /dev/null; then
         PKG_MANAGER="apt"
     elif command -v dnf &> /dev/null; then
         PKG_MANAGER="dnf"
@@ -101,6 +150,11 @@ install_node() {
     echo -e "\n${GREEN}[1/4] Installing Node.js $NODE_VERSION...${NC}"
 
     case $PKG_MANAGER in
+        brew)
+            brew install node@$NODE_VERSION || brew install node
+            # Link if needed
+            brew link --overwrite node@$NODE_VERSION 2>/dev/null || true
+            ;;
         apt)
             curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | sudo -E bash -
             sudo apt-get install -y nodejs
@@ -134,6 +188,9 @@ install_git() {
     if ! command -v git &> /dev/null; then
         echo -e "\n${YELLOW}Installing git...${NC}"
         case $PKG_MANAGER in
+            brew)
+                brew install git
+                ;;
             apt)
                 sudo apt-get install -y git
                 ;;
@@ -154,7 +211,12 @@ install_git() {
 setup_dir() {
     echo -e "\n${GREEN}[2/4] Creating installation directory...${NC}"
     sudo mkdir -p "$INSTALL_DIR"
-    sudo chown "$(whoami):$(whoami)" "$INSTALL_DIR"
+
+    if [ "$OS_TYPE" = "macos" ]; then
+        sudo chown -R "$(whoami):staff" "$INSTALL_DIR"
+    else
+        sudo chown -R "$(whoami):$(whoami)" "$INSTALL_DIR"
+    fi
 }
 
 # Clone and build
@@ -165,7 +227,7 @@ install_agent() {
     if [ -d ".git" ]; then
         git pull
     else
-        git clone https://github.com/your-org/claude-remote-agent.git .
+        git clone https://github.com/haxorthematrix/claude-remote-agent.git .
     fi
 
     npm install
@@ -219,6 +281,13 @@ main() {
     echo "  2. Run 'claude-remote-agent list' to see configured hosts"
     echo "  3. Run 'claude-remote-agent test <host>' to test connections"
     echo ""
+
+    if [ "$OS_TYPE" = "macos" ]; then
+        echo "macOS-specific notes:"
+        echo "  - Uses Homebrew for package management"
+        echo "  - Uses launchd for services (instead of systemd)"
+        echo ""
+    fi
 }
 
 main

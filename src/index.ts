@@ -916,7 +916,7 @@ async function handleRemoteInstallAgent(
       installNode: install_node ?? true,
       nodeVersion: node_version || "20",
       installDir: install_dir || "/opt/claude-remote-agent",
-      createSystemdService: create_service ?? false,
+      createService: create_service ?? false,
     },
     (step, output) => {
       progressLog.push(`[${new Date().toISOString()}] ${step}`);

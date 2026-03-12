@@ -2,7 +2,17 @@
 
 ## Overview
 
-The Claude Remote Agent (CRA) enables Claude CLI to interact with remote Linux systems in real-time via SSH. It acts as an MCP (Model Context Protocol) server that provides tools for remote command execution, file operations, and session management.
+The Claude Remote Agent (CRA) enables Claude CLI to interact with remote Linux and macOS systems in real-time via SSH. It acts as an MCP (Model Context Protocol) server that provides tools for remote command execution, file operations, and session management.
+
+### Supported Platforms
+
+| Platform | Package Manager | Service Manager | Install Directory |
+|----------|-----------------|-----------------|-------------------|
+| Linux (Debian/Ubuntu) | apt | systemd | /opt/claude-remote-agent |
+| Linux (RHEL/CentOS) | dnf/yum | systemd | /opt/claude-remote-agent |
+| Linux (Arch) | pacman | systemd | /opt/claude-remote-agent |
+| Linux (Alpine) | apk | systemd | /opt/claude-remote-agent |
+| **macOS** | **Homebrew** | **launchd** | /usr/local/opt/claude-remote-agent |
 
 ## Architecture
 

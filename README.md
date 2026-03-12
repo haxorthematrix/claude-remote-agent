@@ -1,6 +1,6 @@
 # Claude Remote Agent
 
-An MCP (Model Context Protocol) server that enables Claude CLI to interact with remote Linux systems via SSH in real-time.
+An MCP (Model Context Protocol) server that enables Claude CLI to interact with remote Linux and macOS systems via SSH in real-time.
 
 ## Features
 
@@ -115,6 +115,16 @@ claude-remote-agent add-host my-server \
   -i ~/.ssh/deploy_key \
   --policy moderate
 ```
+
+## Supported Platforms
+
+| Platform | Package Manager | Service Manager |
+|----------|-----------------|-----------------|
+| Ubuntu/Debian | apt | systemd |
+| RHEL/CentOS/Fedora | dnf/yum | systemd |
+| Arch Linux | pacman | systemd |
+| Alpine Linux | apk | systemd |
+| **macOS** | **Homebrew** | **launchd** |
 
 ## Security Policies
 

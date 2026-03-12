@@ -1,29 +1,44 @@
 import { SSHConnection } from "../ssh/connection.js";
 import { HostConfig } from "../types/index.js";
 
+export type OSType = "linux" | "macos" | "unknown";
+
 export interface InstallOptions {
   installNode?: boolean;
   nodeVersion?: string;
   installDir?: string;
-  createSystemdService?: boolean;
+  createService?: boolean;  // systemd on Linux, launchd on macOS
   serviceName?: string;
 }
 
 const DEFAULT_OPTIONS: InstallOptions = {
   installNode: true,
   nodeVersion: "20",
-  installDir: "/opt/claude-remote-agent",
-  createSystemdService: false,
+  installDir: "/opt/claude-remote-agent",  // Will be adjusted for macOS
+  createService: false,
   serviceName: "claude-remote-agent",
 };
+
+/**
+ * Get default install directory based on OS
+ */
+function getDefaultInstallDir(osType: OSType): string {
+  if (osType === "macos") {
+    return "/usr/local/opt/claude-remote-agent";
+  }
+  return "/opt/claude-remote-agent";
+}
+
+export type PackageManager = "apt" | "yum" | "dnf" | "pacman" | "apk" | "brew" | "unknown";
 
 /**
  * Detect the remote system's package manager
  */
 export async function detectPackageManager(
   connection: SSHConnection
-): Promise<"apt" | "yum" | "dnf" | "pacman" | "apk" | "unknown"> {
+): Promise<PackageManager> {
   const checks = [
+    { cmd: "which brew", result: "brew" as const },  // Check brew first (macOS)
     { cmd: "which apt-get", result: "apt" as const },
     { cmd: "which dnf", result: "dnf" as const },
     { cmd: "which yum", result: "yum" as const },
@@ -42,31 +57,58 @@ export async function detectPackageManager(
 }
 
 /**
+ * Detect OS type (Linux vs macOS)
+ */
+export async function detectOSType(connection: SSHConnection): Promise<OSType> {
+  const result = await connection.exec("uname -s");
+  const os = result.stdout.trim().toLowerCase();
+
+  if (os === "darwin") {
+    return "macos";
+  } else if (os === "linux") {
+    return "linux";
+  }
+  return "unknown";
+}
+
+/**
  * Detect OS information
  */
 export async function detectOS(
   connection: SSHConnection
-): Promise<{ distro: string; version: string; arch: string }> {
-  const result = await connection.exec(
-    'cat /etc/os-release 2>/dev/null || echo "ID=unknown"'
-  );
+): Promise<{ osType: OSType; distro: string; version: string; arch: string }> {
+  const osType = await detectOSType(connection);
 
-  const lines = result.stdout.split("\n");
   let distro = "unknown";
   let version = "unknown";
 
-  for (const line of lines) {
-    if (line.startsWith("ID=")) {
-      distro = line.substring(3).replace(/"/g, "");
-    } else if (line.startsWith("VERSION_ID=")) {
-      version = line.substring(11).replace(/"/g, "");
+  if (osType === "macos") {
+    // macOS: use sw_vers
+    const prodResult = await connection.exec("sw_vers -productName 2>/dev/null");
+    const verResult = await connection.exec("sw_vers -productVersion 2>/dev/null");
+
+    distro = prodResult.exit_code === 0 ? prodResult.stdout.trim() : "macOS";
+    version = verResult.exit_code === 0 ? verResult.stdout.trim() : "unknown";
+  } else {
+    // Linux: use /etc/os-release
+    const result = await connection.exec(
+      'cat /etc/os-release 2>/dev/null || echo "ID=unknown"'
+    );
+
+    const lines = result.stdout.split("\n");
+    for (const line of lines) {
+      if (line.startsWith("ID=")) {
+        distro = line.substring(3).replace(/"/g, "");
+      } else if (line.startsWith("VERSION_ID=")) {
+        version = line.substring(11).replace(/"/g, "");
+      }
     }
   }
 
   const archResult = await connection.exec("uname -m");
   const arch = archResult.stdout.trim();
 
-  return { distro, version, arch };
+  return { osType, distro, version, arch };
 }
 
 /**
@@ -91,10 +133,13 @@ export async function checkNodeInstalled(
  * Generate Node.js installation commands for different package managers
  */
 function getNodeInstallCommands(
-  pkgManager: string,
+  pkgManager: PackageManager,
   nodeVersion: string
 ): string[] {
   switch (pkgManager) {
+    case "brew":
+      // Homebrew on macOS - node@version or just node for latest
+      return [`brew install node@${nodeVersion} || brew install node`];
     case "apt":
       return [
         "curl -fsSL https://deb.nodesource.com/setup_" + nodeVersion + ".x | sudo -E bash -",
@@ -120,26 +165,56 @@ function getNodeInstallCommands(
 }
 
 /**
+ * Generate git installation commands for different package managers
+ */
+function getGitInstallCommand(pkgManager: PackageManager): string {
+  switch (pkgManager) {
+    case "brew":
+      return "brew install git";
+    case "apt":
+      return "sudo apt-get install -y git";
+    case "dnf":
+    case "yum":
+      return "sudo yum install -y git";
+    case "pacman":
+      return "sudo pacman -S git --noconfirm";
+    case "apk":
+      return "sudo apk add git";
+    default:
+      throw new Error(`Unsupported package manager: ${pkgManager}`);
+  }
+}
+
+/**
  * Generate the installation script
  */
 export function generateInstallScript(
-  options: InstallOptions = {}
+  options: InstallOptions = {},
+  osType: OSType = "linux"
 ): string {
-  const opts = { ...DEFAULT_OPTIONS, ...options };
+  const installDir = options.installDir || getDefaultInstallDir(osType);
+  const opts = { ...DEFAULT_OPTIONS, ...options, installDir };
+
+  // macOS needs different group ownership
+  const chownCmd = osType === "macos"
+    ? 'sudo chown -R $(whoami):staff "$INSTALL_DIR"'
+    : 'sudo chown -R $(whoami):$(whoami) "$INSTALL_DIR"';
 
   const script = `#!/bin/bash
 set -e
 
 INSTALL_DIR="${opts.installDir}"
 SERVICE_NAME="${opts.serviceName}"
+OS_TYPE="${osType}"
 
 echo "=== Claude Remote Agent Installer ==="
+echo "Target OS: $OS_TYPE"
 echo ""
 
 # Create installation directory
 echo "[1/4] Creating installation directory..."
 sudo mkdir -p "$INSTALL_DIR"
-sudo chown $(whoami):$(whoami) "$INSTALL_DIR"
+${chownCmd}
 
 # Clone or download the agent
 echo "[2/4] Downloading claude-remote-agent..."
@@ -149,11 +224,11 @@ if command -v git &> /dev/null; then
     if [ -d ".git" ]; then
         git pull
     else
-        git clone https://github.com/your-org/claude-remote-agent.git .
+        git clone https://github.com/haxorthematrix/claude-remote-agent.git .
     fi
 else
     # Fallback: download tarball
-    curl -L https://github.com/your-org/claude-remote-agent/archive/main.tar.gz | tar xz --strip-components=1
+    curl -L https://github.com/haxorthematrix/claude-remote-agent/archive/main.tar.gz | tar xz --strip-components=1
 fi
 
 # Install dependencies and build
@@ -182,7 +257,7 @@ echo ""
 }
 
 /**
- * Generate systemd service file
+ * Generate systemd service file (Linux)
  */
 export function generateSystemdService(
   installDir: string,
@@ -208,14 +283,48 @@ WantedBy=multi-user.target
 }
 
 /**
+ * Generate launchd plist file (macOS)
+ */
+export function generateLaunchdPlist(
+  installDir: string,
+  serviceName: string
+): string {
+  const label = `com.claude.${serviceName}`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>${installDir}/dist/cli.js</string>
+        <string>serve</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>${installDir}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/${serviceName}.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/${serviceName}.error.log</string>
+</dict>
+</plist>
+`;
+}
+
+/**
  * Full installation process
  */
 export async function installOnRemote(
   connection: SSHConnection,
   options: InstallOptions = {},
   onProgress?: (step: string, output: string) => void
-): Promise<{ success: boolean; message: string; steps: string[] }> {
-  const opts = { ...DEFAULT_OPTIONS, ...options };
+): Promise<{ success: boolean; message: string; steps: string[]; osType: OSType }> {
   const steps: string[] = [];
 
   const log = (step: string, output: string = "") => {
@@ -225,12 +334,21 @@ export async function installOnRemote(
     }
   };
 
+  let detectedOSType: OSType = "unknown";
+
   try {
     // 1. Detect OS and package manager
     log("Detecting system...");
     const os = await detectOS(connection);
+    detectedOSType = os.osType;
     const pkgManager = await detectPackageManager(connection);
-    log(`Detected: ${os.distro} ${os.version} (${os.arch}), package manager: ${pkgManager}`);
+
+    const osLabel = os.osType === "macos" ? "macOS" : "Linux";
+    log(`Detected: ${osLabel} - ${os.distro} ${os.version} (${os.arch}), package manager: ${pkgManager}`);
+
+    // Adjust install directory based on OS
+    const installDir = options.installDir || getDefaultInstallDir(os.osType);
+    const opts = { ...DEFAULT_OPTIONS, ...options, installDir };
 
     // 2. Check/install Node.js
     const nodeStatus = await checkNodeInstalled(connection);
@@ -252,20 +370,14 @@ export async function installOnRemote(
     const gitCheck = await connection.exec("which git");
     if (gitCheck.exit_code !== 0) {
       log("Installing git...");
-      const gitCmd =
-        pkgManager === "apt"
-          ? "sudo apt-get install -y git"
-          : pkgManager === "dnf" || pkgManager === "yum"
-          ? "sudo yum install -y git"
-          : pkgManager === "pacman"
-          ? "sudo pacman -S git --noconfirm"
-          : "sudo apk add git";
+      const gitCmd = getGitInstallCommand(pkgManager);
       await connection.exec(gitCmd);
+      log("Git installed");
     }
 
     // 4. Run installation script
     log("Running installation script...");
-    const script = generateInstallScript(opts);
+    const script = generateInstallScript(opts, os.osType);
 
     // Upload and execute script
     await connection.writeFile("/tmp/install-cra.sh", script, { mode: 0o755 });
@@ -278,20 +390,38 @@ export async function installOnRemote(
     }
     log("Installation script completed", installResult.stdout);
 
-    // 5. Set up systemd service if requested
-    if (opts.createSystemdService) {
-      log("Creating systemd service...");
-      const serviceContent = generateSystemdService(
-        opts.installDir!,
-        opts.serviceName!
-      );
-      await connection.writeFile(
-        `/etc/systemd/system/${opts.serviceName}.service`,
-        serviceContent
-      );
-      await connection.exec("sudo systemctl daemon-reload");
-      await connection.exec(`sudo systemctl enable ${opts.serviceName}`);
-      log("Systemd service created and enabled");
+    // 5. Set up service if requested (systemd for Linux, launchd for macOS)
+    if (opts.createService) {
+      if (os.osType === "macos") {
+        log("Creating launchd service...");
+        const plistContent = generateLaunchdPlist(
+          opts.installDir!,
+          opts.serviceName!
+        );
+        const plistPath = `/Library/LaunchDaemons/com.claude.${opts.serviceName}.plist`;
+
+        // Create log directory
+        await connection.exec("sudo mkdir -p /usr/local/var/log");
+
+        await connection.writeFile(plistPath, plistContent);
+        await connection.exec(`sudo chown root:wheel ${plistPath}`);
+        await connection.exec(`sudo chmod 644 ${plistPath}`);
+        await connection.exec(`sudo launchctl load ${plistPath}`);
+        log("Launchd service created and loaded");
+      } else {
+        log("Creating systemd service...");
+        const serviceContent = generateSystemdService(
+          opts.installDir!,
+          opts.serviceName!
+        );
+        await connection.writeFile(
+          `/etc/systemd/system/${opts.serviceName}.service`,
+          serviceContent
+        );
+        await connection.exec("sudo systemctl daemon-reload");
+        await connection.exec(`sudo systemctl enable ${opts.serviceName}`);
+        log("Systemd service created and enabled");
+      }
     }
 
     // 6. Initialize config
@@ -309,8 +439,9 @@ export async function installOnRemote(
 
     return {
       success: true,
-      message: "Claude Remote Agent installed successfully",
+      message: `Claude Remote Agent installed successfully on ${osLabel}`,
       steps,
+      osType: os.osType,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -318,6 +449,7 @@ export async function installOnRemote(
       success: false,
       message: `Installation failed: ${message}`,
       steps,
+      osType: detectedOSType,
     };
   }
 }
