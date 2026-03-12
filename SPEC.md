@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Claude Remote Agent (CRA) enables Claude CLI to interact with remote Linux and macOS systems in real-time via SSH. It acts as an MCP (Model Context Protocol) server that provides tools for remote command execution, file operations, and session management.
+The Claude Remote Agent (CRA) enables Claude CLI to interact with remote Linux, macOS, and Windows systems in real-time via SSH. It acts as an MCP (Model Context Protocol) server that provides tools for remote command execution, file operations, and session management.
 
 ### Supported Platforms
 
@@ -12,7 +12,15 @@ The Claude Remote Agent (CRA) enables Claude CLI to interact with remote Linux a
 | Linux (RHEL/CentOS) | dnf/yum | systemd | /opt/claude-remote-agent |
 | Linux (Arch) | pacman | systemd | /opt/claude-remote-agent |
 | Linux (Alpine) | apk | systemd | /opt/claude-remote-agent |
-| **macOS** | **Homebrew** | **launchd** | /usr/local/opt/claude-remote-agent |
+| macOS | Homebrew | launchd | /usr/local/opt/claude-remote-agent |
+| **Windows 10/11** | **winget, choco, scoop** | **Windows Services** | C:\Program Files\claude-remote-agent |
+
+#### Windows Requirements
+
+- OpenSSH Server must be enabled on the remote Windows machine
+- Enable via: Settings > Apps > Optional Features > OpenSSH Server
+- Or via PowerShell (Admin): `Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0`
+- Start the service: `Start-Service sshd; Set-Service -Name sshd -StartupType Automatic`
 
 ## Architecture
 
@@ -24,12 +32,12 @@ The Claude Remote Agent (CRA) enables Claude CLI to interact with remote Linux a
                                                      │
                                           SSH Connections (persistent)
                                                      │
-                              ┌──────────────────────┼──────────────────────┐
-                              ▼                      ▼                      ▼
-                        ┌──────────┐           ┌──────────┐           ┌──────────┐
-                        │ Host A   │           │ Host B   │           │ Host C   │
-                        │ (prod)   │           │ (staging)│           │ (dev)    │
-                        └──────────┘           └──────────┘           └──────────┘
+                    ┌────────────────────────────────┼────────────────────────────────┐
+                    ▼                      ▼                      ▼                   ▼
+              ┌──────────┐           ┌──────────┐           ┌──────────┐        ┌──────────┐
+              │ Linux    │           │ macOS    │           │ Windows  │        │ Linux    │
+              │ (prod)   │           │ (dev)    │           │ (build)  │        │ (staging)│
+              └──────────┘           └──────────┘           └──────────┘        └──────────┘
 ```
 
 ## Components
@@ -210,6 +218,27 @@ hosts:
       allowed_commands:
         - "psql -c 'SELECT *'"  # Read-only queries only
         - "pg_dump *"
+
+  # Windows build server
+  windows-build:
+    hostname: build.example.com
+    port: 22
+    user: buildadmin
+    auth:
+      type: key
+      key_path: ~/.ssh/id_ed25519
+
+    policy:
+      confirmation_required: destructive_only
+      allowed_commands: "*"
+      blocked_commands:
+        - "format *"
+        - "shutdown *"
+        - "restart-computer"
+
+    labels:
+      environment: build
+      os: windows
 
 # Host groups for batch operations
 groups:
@@ -440,15 +469,19 @@ These tools enable Claude to install the remote agent on new systems using its e
 
 ### 15. `remote_install_agent`
 
-Install the Claude Remote Agent on a remote Linux system.
+Install the Claude Remote Agent on a remote Linux, macOS, or Windows system.
 
 ```typescript
 interface RemoteInstallAgentParams {
   host: string;            // Host from config or SSH alias
   install_node?: boolean;  // Install Node.js if needed (default: true)
   node_version?: string;   // Node.js version (default: "20")
-  install_dir?: string;    // Installation path (default: /opt/claude-remote-agent)
-  create_service?: boolean; // Create systemd service (default: false)
+  install_dir?: string;    // Installation path (OS-dependent default)
+                           // Linux: /opt/claude-remote-agent
+                           // macOS: /usr/local/opt/claude-remote-agent
+                           // Windows: C:\Program Files\claude-remote-agent
+  create_service?: boolean; // Create system service (default: false)
+                           // Linux: systemd, macOS: launchd, Windows: Windows Service
 }
 
 interface RemoteInstallAgentResult {
@@ -468,10 +501,13 @@ interface RemoteDetectSystemParams {
 }
 
 interface RemoteDetectSystemResult {
-  distro: string;      // e.g., "ubuntu", "debian", "centos"
-  version: string;     // e.g., "22.04"
-  arch: string;        // e.g., "x86_64", "aarch64"
-  package_manager: string;  // e.g., "apt", "yum", "dnf"
+  os_type: string;     // "linux", "macos", or "windows"
+  distro: string;      // e.g., "ubuntu", "debian", "centos", "macOS", "Windows 11 Pro"
+  version: string;     // e.g., "22.04", "14.0", "10.0.22621"
+  arch: string;        // e.g., "x86_64", "aarch64", "AMD64"
+  package_manager: string;  // Linux: "apt", "yum", "dnf", "pacman", "apk"
+                            // macOS: "brew"
+                            // Windows: "winget", "choco", "scoop"
   node_installed: boolean;
   node_version?: string;
 }
@@ -529,6 +565,22 @@ Check current permissions mode (normal vs skip-permissions).
 | `destructive_only` | Confirm only for rm, kill, stop, restart, etc. |
 | `write_only` | Confirm any write/modify operations |
 | `always` | Confirm every command |
+
+### Platform-Specific Dangerous Commands
+
+Commands that trigger confirmation (when `destructive_only` or higher):
+
+**Linux/macOS:**
+- `rm`, `rmdir`, `kill`, `killall`, `pkill`
+- `shutdown`, `reboot`, `halt`, `poweroff`
+- `systemctl stop/restart`, `launchctl unload/kill`
+- `docker rm/stop/kill`, `kubectl delete`
+
+**Windows:**
+- `del`, `erase`, `rd`, `rmdir`, `format`
+- `taskkill`, `Stop-Process`, `Stop-Service`
+- `shutdown`, `Restart-Computer`, `Stop-Computer`
+- `Clear-Disk`, `Remove-Partition`, `Remove-Volume`
 
 ### Command Matching
 
@@ -848,6 +900,65 @@ SSH Aliases (4):
     User: dbadmin
 ```
 
+### Scenario 8: Windows Build Server Management
+
+```
+User: Install Visual Studio Build Tools on windows-build and run a build
+
+Claude: I'll set up the build environment on your Windows build server.
+
+[Uses remote_detect_system]
+
+System detected:
+- OS: Windows 11 Pro
+- Architecture: AMD64
+- Package Manager: winget
+- Node.js: v20.10.0 installed
+
+[Uses remote_execute with PowerShell commands]
+
+1. ✓ Installing Visual Studio Build Tools via winget...
+   winget install Microsoft.VisualStudio.2022.BuildTools --accept-package-agreements
+
+2. ✓ Cloning repository...
+   git clone https://github.com/example/project C:\build\project
+
+3. ✓ Running MSBuild...
+   msbuild C:\build\project\solution.sln /p:Configuration=Release
+
+Build completed successfully:
+- Output: C:\build\project\bin\Release\
+- Artifacts: 3 DLLs, 1 EXE
+- Build time: 2m 34s
+```
+
+### Scenario 9: Cross-Platform Deployment
+
+```
+User: Deploy the app to all servers - Linux prod, macOS staging, and Windows build
+
+Claude: I'll deploy across all platforms.
+
+[Uses remote_execute on each host with platform-appropriate commands]
+
+Linux (prod-web-1):
+  ✓ git pull origin main
+  ✓ npm install && npm run build
+  ✓ sudo systemctl restart app
+
+macOS (staging-mac):
+  ✓ git pull origin main
+  ✓ npm install && npm run build
+  ✓ launchctl kickstart -k gui/501/com.example.app
+
+Windows (windows-build):
+  ✓ git pull origin main
+  ✓ npm install; npm run build
+  ✓ Restart-Service -Name "ExampleApp"
+
+All 3 servers deployed successfully!
+```
+
 ---
 
 ## Error Handling
@@ -880,7 +991,8 @@ interface PolicyViolation {
 ## Future Enhancements
 
 ### Phase 2
-- [ ] Windows Remote Management (WinRM) support
+- [x] ~~Windows SSH support~~ (Completed)
+- [ ] Windows Remote Management (WinRM) as alternative to SSH
 - [ ] Docker container execution (without SSH)
 - [ ] Kubernetes pod execution
 - [ ] AWS SSM Session Manager integration
@@ -910,6 +1022,16 @@ interface PolicyViolation {
 4. **Session Isolation**: Each Claude session should have isolated connection contexts to prevent cross-session leakage.
 
 5. **Output Sanitization**: Sensitive data in command output (passwords, tokens) should be detected and redacted in logs.
+
+### Windows-Specific Security
+
+6. **Windows SSH**: OpenSSH on Windows runs as SYSTEM by default. Ensure proper ACLs on the sshd_config and authorized_keys files.
+
+7. **PowerShell Execution Policy**: The agent uses `-ExecutionPolicy Bypass` for installation scripts. Consider setting a more restrictive policy for production.
+
+8. **Windows Services**: Services created via NSSM or sc.exe run as LocalSystem by default. Consider creating a dedicated service account with minimal privileges.
+
+9. **Registry Access**: Commands like `reg add` and `Set-ItemProperty` can modify system registry. Block these in production policies unless explicitly needed.
 
 ---
 
