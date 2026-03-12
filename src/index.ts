@@ -136,6 +136,87 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "remote_file_edit",
+    description:
+      "Edit a file on a remote host using find/replace. Similar to the local Edit tool but for remote files.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        host: {
+          type: "string",
+          description: "Host name from configuration",
+        },
+        path: {
+          type: "string",
+          description: "Absolute path to the file",
+        },
+        old_string: {
+          type: "string",
+          description: "The text to find and replace",
+        },
+        new_string: {
+          type: "string",
+          description: "The text to replace it with",
+        },
+        replace_all: {
+          type: "boolean",
+          description: "Replace all occurrences (default: false, replaces first only)",
+        },
+      },
+      required: ["host", "path", "old_string", "new_string"],
+    },
+  },
+  {
+    name: "remote_upload",
+    description:
+      "Upload a local file to a remote host via SFTP. Transfers a file from the local machine to the remote server.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        host: {
+          type: "string",
+          description: "Host name from configuration",
+        },
+        local_path: {
+          type: "string",
+          description: "Path to the local file to upload",
+        },
+        remote_path: {
+          type: "string",
+          description: "Destination path on the remote host",
+        },
+        mode: {
+          type: "string",
+          description: "File permissions (e.g., '0644')",
+        },
+      },
+      required: ["host", "local_path", "remote_path"],
+    },
+  },
+  {
+    name: "remote_download",
+    description:
+      "Download a file from a remote host to the local machine via SFTP.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        host: {
+          type: "string",
+          description: "Host name from configuration",
+        },
+        remote_path: {
+          type: "string",
+          description: "Path to the file on the remote host",
+        },
+        local_path: {
+          type: "string",
+          description: "Destination path on the local machine",
+        },
+      },
+      required: ["host", "remote_path", "local_path"],
+    },
+  },
+  {
     name: "remote_list_hosts",
     description: "List all configured remote hosts with their status and policies",
     inputSchema: {
@@ -435,6 +516,30 @@ export async function createServer(configDir?: string): Promise<Server> {
         case "remote_file_write":
           return await handleRemoteFileWrite(configLoader, toolArgs as unknown as RemoteFileWriteParams);
 
+        case "remote_file_edit":
+          return await handleRemoteFileEdit(configLoader, toolArgs as unknown as {
+            host: string;
+            path: string;
+            old_string: string;
+            new_string: string;
+            replace_all?: boolean;
+          });
+
+        case "remote_upload":
+          return await handleRemoteUpload(configLoader, toolArgs as unknown as {
+            host: string;
+            local_path: string;
+            remote_path: string;
+            mode?: string;
+          });
+
+        case "remote_download":
+          return await handleRemoteDownload(configLoader, toolArgs as unknown as {
+            host: string;
+            remote_path: string;
+            local_path: string;
+          });
+
         case "remote_list_hosts":
           return await handleListHosts(configLoader);
 
@@ -664,6 +769,173 @@ async function handleRemoteFileWrite(
 
   return {
     content: [{ type: "text", text: `File written successfully: ${filePath}` }],
+  };
+}
+
+async function handleRemoteFileEdit(
+  configLoader: ConfigLoader,
+  params: {
+    host: string;
+    path: string;
+    old_string: string;
+    new_string: string;
+    replace_all?: boolean;
+  }
+) {
+  const { host, path: filePath, old_string, new_string, replace_all } = params;
+
+  const hostConfig = configLoader.getHost(host);
+  if (!hostConfig) {
+    throw new Error(`Unknown host: ${host}`);
+  }
+
+  // Check policy for write operations
+  const policy = configLoader.getEffectivePolicy(host);
+  if (policy.read_only) {
+    throw new Error(`Host ${host} is in read-only mode`);
+  }
+
+  let connection = connectionPool.get(host);
+  if (!connection) {
+    connection = new SSHConnection(host, hostConfig);
+    connectionPool.set(host, connection);
+  }
+
+  // Read current content
+  const content = await connection.readFile(filePath);
+
+  // Check if old_string exists
+  if (!content.includes(old_string)) {
+    throw new Error(
+      `Could not find the specified text in ${filePath}. ` +
+      `Make sure the old_string matches exactly (including whitespace).`
+    );
+  }
+
+  // Check for uniqueness if not replacing all
+  if (!replace_all) {
+    const occurrences = content.split(old_string).length - 1;
+    if (occurrences > 1) {
+      throw new Error(
+        `Found ${occurrences} occurrences of the specified text. ` +
+        `Either use replace_all: true, or provide more context to make the match unique.`
+      );
+    }
+  }
+
+  // Perform replacement
+  let newContent: string;
+  if (replace_all) {
+    newContent = content.split(old_string).join(new_string);
+  } else {
+    newContent = content.replace(old_string, new_string);
+  }
+
+  // Write back
+  await connection.writeFile(filePath, newContent);
+
+  const replacements = replace_all ? content.split(old_string).length - 1 : 1;
+  return {
+    content: [
+      {
+        type: "text",
+        text: `File edited successfully: ${filePath}\n` +
+          `Replaced ${replacements} occurrence(s).`,
+      },
+    ],
+  };
+}
+
+async function handleRemoteUpload(
+  configLoader: ConfigLoader,
+  params: {
+    host: string;
+    local_path: string;
+    remote_path: string;
+    mode?: string;
+  }
+) {
+  const { host, local_path, remote_path, mode } = params;
+
+  const hostConfig = configLoader.getHost(host);
+  if (!hostConfig) {
+    throw new Error(`Unknown host: ${host}`);
+  }
+
+  // Check policy for write operations
+  const policy = configLoader.getEffectivePolicy(host);
+  if (policy.read_only) {
+    throw new Error(`Host ${host} is in read-only mode`);
+  }
+
+  let connection = connectionPool.get(host);
+  if (!connection) {
+    connection = new SSHConnection(host, hostConfig);
+    connectionPool.set(host, connection);
+  }
+
+  const modeNum = mode ? parseInt(mode, 8) : undefined;
+  await connection.uploadFile(local_path, remote_path, { mode: modeNum });
+
+  // Get file size for confirmation
+  const fs = await import("fs");
+  const stats = fs.statSync(local_path.replace(/^~/, process.env.HOME || ""));
+  const sizeKB = (stats.size / 1024).toFixed(2);
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: `File uploaded successfully!\n` +
+          `  Local: ${local_path}\n` +
+          `  Remote: ${host}:${remote_path}\n` +
+          `  Size: ${sizeKB} KB`,
+      },
+    ],
+  };
+}
+
+async function handleRemoteDownload(
+  configLoader: ConfigLoader,
+  params: {
+    host: string;
+    remote_path: string;
+    local_path: string;
+  }
+) {
+  const { host, remote_path, local_path } = params;
+
+  const hostConfig = configLoader.getHost(host);
+  if (!hostConfig) {
+    throw new Error(`Unknown host: ${host}`);
+  }
+
+  let connection = connectionPool.get(host);
+  if (!connection) {
+    connection = new SSHConnection(host, hostConfig);
+    connectionPool.set(host, connection);
+  }
+
+  // Get remote file stats first
+  const remoteStats = await connection.stat(remote_path);
+  if (remoteStats.isDirectory) {
+    throw new Error(`${remote_path} is a directory. Only files can be downloaded.`);
+  }
+
+  await connection.downloadFile(remote_path, local_path);
+
+  const sizeKB = (remoteStats.size / 1024).toFixed(2);
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: `File downloaded successfully!\n` +
+          `  Remote: ${host}:${remote_path}\n` +
+          `  Local: ${local_path}\n` +
+          `  Size: ${sizeKB} KB`,
+      },
+    ],
   };
 }
 

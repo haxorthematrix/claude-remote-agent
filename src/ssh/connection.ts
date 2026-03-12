@@ -195,6 +195,125 @@ export class SSHConnection {
   }
 
   /**
+   * Upload a local file to the remote host via SFTP
+   */
+  async uploadFile(
+    localPath: string,
+    remotePath: string,
+    options: { mode?: number } = {}
+  ): Promise<void> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    const expandedLocalPath = this.expandPath(localPath);
+
+    return new Promise((resolve, reject) => {
+      this.client.sftp((err, sftp) => {
+        if (err) {
+          reject(new Error(`SFTP connection failed: ${err.message}`));
+          return;
+        }
+
+        const readStream = fs.createReadStream(expandedLocalPath);
+        const writeStream = sftp.createWriteStream(remotePath, {
+          mode: options.mode,
+        });
+
+        writeStream.on("close", () => {
+          resolve();
+        });
+
+        writeStream.on("error", (err: Error) => {
+          reject(new Error(`Failed to upload file to ${remotePath}: ${err.message}`));
+        });
+
+        readStream.on("error", (err: Error) => {
+          reject(new Error(`Failed to read local file ${localPath}: ${err.message}`));
+        });
+
+        readStream.pipe(writeStream);
+      });
+    });
+  }
+
+  /**
+   * Download a file from the remote host to local via SFTP
+   */
+  async downloadFile(
+    remotePath: string,
+    localPath: string
+  ): Promise<void> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    const expandedLocalPath = this.expandPath(localPath);
+
+    // Ensure local directory exists
+    const localDir = path.dirname(expandedLocalPath);
+    if (!fs.existsSync(localDir)) {
+      fs.mkdirSync(localDir, { recursive: true });
+    }
+
+    return new Promise((resolve, reject) => {
+      this.client.sftp((err, sftp) => {
+        if (err) {
+          reject(new Error(`SFTP connection failed: ${err.message}`));
+          return;
+        }
+
+        const readStream = sftp.createReadStream(remotePath);
+        const writeStream = fs.createWriteStream(expandedLocalPath);
+
+        writeStream.on("close", () => {
+          resolve();
+        });
+
+        writeStream.on("error", (err: Error) => {
+          reject(new Error(`Failed to write local file ${localPath}: ${err.message}`));
+        });
+
+        readStream.on("error", (err: Error) => {
+          reject(new Error(`Failed to download file ${remotePath}: ${err.message}`));
+        });
+
+        readStream.pipe(writeStream);
+      });
+    });
+  }
+
+  /**
+   * Get file stats from remote host
+   */
+  async stat(remotePath: string): Promise<{ size: number; isDirectory: boolean; mode: number }> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    return new Promise((resolve, reject) => {
+      this.client.sftp((err, sftp) => {
+        if (err) {
+          reject(new Error(`SFTP connection failed: ${err.message}`));
+          return;
+        }
+
+        sftp.stat(remotePath, (err, stats) => {
+          if (err) {
+            reject(new Error(`Failed to stat ${remotePath}: ${err.message}`));
+            return;
+          }
+          resolve({
+            size: stats.size,
+            isDirectory: stats.isDirectory(),
+            mode: stats.mode,
+          });
+        });
+      });
+    });
+  }
+
+  /**
    * Check if connected
    */
   isConnected(): boolean {
