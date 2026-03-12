@@ -1,0 +1,94 @@
+# Claude Remote Agent - Host Configuration
+# Copy to ~/.config/claude-remote-agent/hosts.yaml
+
+hosts:
+  # Example: Development server with relaxed security
+  dev-server:
+    hostname: dev.example.com
+    port: 22
+    user: developer
+    auth:
+      type: key
+      key_path: ~/.ssh/id_ed25519
+
+    policy:
+      confirmation_required: never
+      allowed_commands: "*"
+
+    labels:
+      environment: development
+      team: backend
+
+  # Example: Staging server with moderate security
+  staging:
+    hostname: staging.example.com
+    port: 22
+    user: deploy
+    auth:
+      type: key
+      key_path: ~/.ssh/deploy_key
+
+    policy:
+      confirmation_required: destructive_only
+      allowed_commands: "*"
+      blocked_commands:
+        - "reboot"
+        - "shutdown"
+
+    labels:
+      environment: staging
+
+  # Example: Production server with strict security
+  prod-web-1:
+    hostname: prod-web-1.example.com
+    port: 22
+    user: ops
+    auth:
+      type: key
+      key_path: ~/.ssh/prod_key
+
+    policy:
+      confirmation_required: always
+      # Only allow read-only commands
+      allowed_commands:
+        - "systemctl status *"
+        - "journalctl *"
+        - "tail *"
+        - "head *"
+        - "cat /var/log/*"
+        - "less /var/log/*"
+        - "df *"
+        - "free *"
+        - "top -bn1"
+        - "ps *"
+        - "netstat *"
+        - "ss *"
+        - "uptime"
+        - "whoami"
+        - "hostname"
+      read_only: true
+
+    labels:
+      environment: production
+      role: webserver
+
+  # Example: Host accessible via jump/bastion host
+  # internal-db:
+  #   hostname: 10.0.1.50
+  #   port: 22
+  #   user: dbadmin
+  #   auth:
+  #     type: key
+  #     key_path: ~/.ssh/internal_key
+  #   proxy_jump: bastion
+
+# Host groups for batch operations
+groups:
+  web-servers:
+    - prod-web-1
+    # - prod-web-2
+
+  all-prod:
+    - prod-web-1
+    # - prod-web-2
+    # - prod-db-1

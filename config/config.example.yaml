@@ -1,0 +1,41 @@
+# Claude Remote Agent - Global Configuration
+# Copy to ~/.config/claude-remote-agent/config.yaml
+
+global:
+  # Default timeout for commands (seconds)
+  default_timeout: 300
+
+  # Connection pool settings
+  connection_pool:
+    max_connections_per_host: 5
+    idle_timeout: 600
+    keepalive_interval: 30
+
+  # Audit logging
+  audit:
+    enabled: true
+    log_path: ~/.config/claude-remote-agent/audit.log
+    log_commands: true
+    log_output: true
+    max_output_logged: 10000
+
+  # Default security policy (can be overridden per-host)
+  default_policy:
+    # Confirmation levels: never, destructive_only, write_only, always
+    confirmation_required: destructive_only
+
+    # Empty = all allowed (subject to blocklist)
+    allowed_commands: []
+
+    # Dangerous commands that should never run
+    blocked_commands:
+      - "rm -rf /"
+      - "rm -rf /*"
+      - ":(){ :|:& };:"
+      - "mkfs.*"
+      - "dd if=.* of=/dev/.*"
+
+    blocked_patterns:
+      - ".*>/dev/sd[a-z]"
+      - "chmod -R 777 /"
+      - "chown -R .* /"
