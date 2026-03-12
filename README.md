@@ -1,6 +1,6 @@
 # Claude Remote Agent
 
-An MCP (Model Context Protocol) server that enables Claude CLI to interact with remote Linux and macOS systems via SSH in real-time.
+An MCP (Model Context Protocol) server that enables Claude CLI to interact with remote Linux, macOS, and Windows systems via SSH in real-time.
 
 ## Features
 
@@ -16,11 +16,11 @@ An MCP (Model Context Protocol) server that enables Claude CLI to interact with 
 
 ## Quick Start
 
-### Installation
+### Installation (Linux/macOS)
 
 ```bash
 # Clone and build
-git clone https://github.com/your-org/claude-remote-agent
+git clone https://github.com/haxorthematrix/claude-remote-agent
 cd claude-remote-agent
 npm install
 npm run build
@@ -32,12 +32,36 @@ npm link
 claude-remote-agent init
 ```
 
+### Installation (Windows)
+
+**Prerequisites:** Node.js 18+ and Git must be installed. You can install them via:
+- **winget:** `winget install OpenJS.NodeJS.LTS` and `winget install Git.Git`
+- **Chocolatey:** `choco install nodejs-lts git -y`
+- **Scoop:** `scoop install nodejs-lts git`
+
+```powershell
+# Clone and build
+git clone https://github.com/haxorthematrix/claude-remote-agent
+cd claude-remote-agent
+npm install
+npm run build
+
+# Link globally
+npm link
+
+# Initialize configuration
+claude-remote-agent init
+```
+
+**Note:** Windows SSH support requires OpenSSH client, which is included in Windows 10/11. For older versions, install via `winget install Microsoft.OpenSSH.Client` or enable it in Windows Features.
+
 ### Configuration
 
-Edit `~/.config/claude-remote-agent/hosts.yaml` to add your remote hosts:
+Edit `~/.config/claude-remote-agent/hosts.yaml` (or `%USERPROFILE%\.config\claude-remote-agent\hosts.yaml` on Windows) to add your remote hosts:
 
 ```yaml
 hosts:
+  # Linux/macOS server
   my-server:
     hostname: 192.168.1.100
     port: 22
@@ -47,6 +71,17 @@ hosts:
       key_path: ~/.ssh/id_ed25519
     policy:
       confirmation_required: destructive_only
+
+  # Windows server
+  win-server:
+    hostname: 192.168.1.200
+    port: 22
+    user: Administrator
+    auth:
+      type: key
+      key_path: ~/.ssh/id_ed25519
+    policy:
+      confirmation_required: always  # Be extra careful on Windows
 ```
 
 ### Register with Claude CLI
@@ -124,7 +159,16 @@ claude-remote-agent add-host my-server \
 | RHEL/CentOS/Fedora | dnf/yum | systemd |
 | Arch Linux | pacman | systemd |
 | Alpine Linux | apk | systemd |
-| **macOS** | **Homebrew** | **launchd** |
+| macOS | Homebrew | launchd |
+| **Windows 10/11** | **winget, choco, scoop** | **Windows Services** |
+
+### Windows Notes
+
+- Requires OpenSSH server enabled on the remote Windows machine
+- SSH can be enabled via Settings > Apps > Optional Features > OpenSSH Server
+- Or via PowerShell (Admin): `Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0`
+- The agent installs to `C:\Program Files\claude-remote-agent` by default
+- Windows service creation uses NSSM if available, otherwise falls back to sc.exe
 
 ## Security Policies
 
