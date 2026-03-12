@@ -2,6 +2,33 @@
 
 An MCP (Model Context Protocol) server that enables Claude CLI to interact with remote Linux, macOS, and Windows systems via SSH in real-time.
 
+## Privacy & Credential Security
+
+**Your credentials never leave your machine.**
+
+This MCP server runs entirely on your local machine and connects directly to your remote hosts using standard SSH:
+
+- **Local Storage Only**: All configuration, credentials, and SSH keys are stored locally in `~/.config/claude-remote-agent/` and `~/.ssh/`
+- **No Third-Party Sharing**: Your passwords, SSH keys, and host credentials are never sent to Anthropic, Claude, or any external service
+- **Standard SSH**: Uses your existing SSH infrastructure - the same keys and config you use with `ssh` command
+- **SSH Agent Support**: Can use your running `ssh-agent` so private keys never touch disk unencrypted
+- **Direct Connections**: SSH connections go directly from your machine to your remote hosts - no proxy or relay servers
+
+**How it works:**
+```
+Your Machine                          Remote Hosts
+┌─────────────────────┐               ┌─────────────┐
+│ Claude CLI          │               │ my-server   │
+│   ↓                 │    SSH        │             │
+│ MCP Server (local)  │──────────────→│ (your host) │
+│   ↓                 │   Direct      │             │
+│ ~/.ssh/id_ed25519   │  Connection   └─────────────┘
+│ ~/.config/cra/      │
+└─────────────────────┘
+```
+
+Claude sees only the *results* of commands (stdout/stderr), never your SSH keys or passwords.
+
 ## Requirements
 
 ### Local Machine (where you run Claude CLI)
