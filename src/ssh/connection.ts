@@ -11,16 +11,26 @@ export interface ExecResult {
   duration_ms: number;
 }
 
+export interface ProxyJumpConfig {
+  hostname: string;
+  port: number;
+  user: string;
+  auth: AuthConfig;
+}
+
 export class SSHConnection {
   private client: Client;
+  private proxyClient: Client | null = null;
   private connected: boolean = false;
   private hostName: string;
   private config: HostConfig;
+  private proxyConfig: ProxyJumpConfig | null = null;
 
-  constructor(hostName: string, config: HostConfig) {
+  constructor(hostName: string, config: HostConfig, proxyConfig?: ProxyJumpConfig) {
     this.client = new Client();
     this.hostName = hostName;
     this.config = config;
+    this.proxyConfig = proxyConfig || null;
   }
 
   /**
@@ -31,6 +41,18 @@ export class SSHConnection {
       return;
     }
 
+    // If we have a proxy config, connect through the proxy first
+    if (this.proxyConfig) {
+      await this.connectThroughProxy();
+    } else {
+      await this.connectDirect();
+    }
+  }
+
+  /**
+   * Connect directly to the host
+   */
+  private async connectDirect(): Promise<void> {
     const connectConfig = await this.buildConnectConfig();
 
     return new Promise((resolve, reject) => {
@@ -42,6 +64,75 @@ export class SSHConnection {
       this.client.on("error", (err) => {
         this.connected = false;
         reject(new Error(`SSH connection failed to ${this.hostName}: ${err.message}`));
+      });
+
+      this.client.on("close", () => {
+        this.connected = false;
+      });
+
+      this.client.connect(connectConfig);
+    });
+  }
+
+  /**
+   * Connect through a proxy/bastion host (ProxyJump)
+   */
+  private async connectThroughProxy(): Promise<void> {
+    if (!this.proxyConfig) {
+      throw new Error("No proxy configuration provided");
+    }
+
+    // Step 1: Connect to the proxy/bastion host
+    this.proxyClient = new Client();
+    const proxyConnectConfig = await this.buildConnectConfigForProxy(this.proxyConfig);
+
+    await new Promise<void>((resolve, reject) => {
+      this.proxyClient!.on("ready", () => {
+        resolve();
+      });
+
+      this.proxyClient!.on("error", (err) => {
+        reject(new Error(`SSH connection to proxy host failed: ${err.message}`));
+      });
+
+      this.proxyClient!.connect(proxyConnectConfig);
+    });
+
+    // Step 2: Create a forwarded connection to the final destination
+    const destHost = this.config.hostname;
+    const destPort = this.config.port || 22;
+
+    const stream = await new Promise<ClientChannel>((resolve, reject) => {
+      this.proxyClient!.forwardOut(
+        "127.0.0.1",
+        0, // Let the system choose a source port
+        destHost,
+        destPort,
+        (err, stream) => {
+          if (err) {
+            reject(new Error(`Failed to forward connection through proxy: ${err.message}`));
+            return;
+          }
+          resolve(stream);
+        }
+      );
+    });
+
+    // Step 3: Connect to the final destination through the forwarded stream
+    const connectConfig = await this.buildConnectConfig();
+    // Use the stream as the socket for the connection
+    // The ssh2 library supports using a Channel as sock for proxy connections
+    (connectConfig as Record<string, unknown>).sock = stream;
+
+    return new Promise((resolve, reject) => {
+      this.client.on("ready", () => {
+        this.connected = true;
+        resolve();
+      });
+
+      this.client.on("error", (err) => {
+        this.connected = false;
+        reject(new Error(`SSH connection to ${this.hostName} through proxy failed: ${err.message}`));
       });
 
       this.client.on("close", () => {
@@ -328,6 +419,25 @@ export class SSHConnection {
       this.client.end();
       this.connected = false;
     }
+    // Also disconnect the proxy client if we used one
+    if (this.proxyClient) {
+      this.proxyClient.end();
+      this.proxyClient = null;
+    }
+  }
+
+  /**
+   * Check if using a proxy connection
+   */
+  isUsingProxy(): boolean {
+    return this.proxyConfig !== null;
+  }
+
+  /**
+   * Get proxy host name (if using proxy)
+   */
+  getProxyHost(): string | null {
+    return this.proxyConfig?.hostname || null;
   }
 
   /**
@@ -342,6 +452,40 @@ export class SSHConnection {
 
     // Handle authentication
     const auth = this.config.auth;
+
+    switch (auth.type) {
+      case "key":
+        const keyPath = this.expandPath(auth.key_path);
+        config.privateKey = fs.readFileSync(keyPath);
+        if (auth.passphrase) {
+          config.passphrase = auth.passphrase;
+        }
+        break;
+
+      case "password":
+        config.password = auth.password;
+        break;
+
+      case "agent":
+        config.agent = process.env.SSH_AUTH_SOCK;
+        break;
+    }
+
+    return config;
+  }
+
+  /**
+   * Build ssh2 connect configuration for proxy host
+   */
+  private async buildConnectConfigForProxy(proxyConfig: ProxyJumpConfig): Promise<ConnectConfig> {
+    const config: ConnectConfig = {
+      host: proxyConfig.hostname,
+      port: proxyConfig.port || 22,
+      username: proxyConfig.user,
+    };
+
+    // Handle authentication for proxy
+    const auth = proxyConfig.auth;
 
     switch (auth.type) {
       case "key":

@@ -7,7 +7,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { getConfigLoader, ConfigLoader } from "./config/loader.js";
-import { SSHConnection } from "./ssh/connection.js";
+import { SSHConnection, ProxyJumpConfig } from "./ssh/connection.js";
 import { policyEngine, logSkipPermissionsWarning } from "./security/policy.js";
 import { initAuditLogger, getAuditLogger, AuditLogger } from "./security/audit.js";
 import {
@@ -26,6 +26,7 @@ import {
   getQuickInstallCommand,
 } from "./installer/remote-install.js";
 import {
+  HostConfig,
   RemoteExecuteParams,
   RemoteFileReadParams,
   RemoteFileWriteParams,
@@ -33,6 +34,43 @@ import {
 
 // Connection pool
 const connectionPool: Map<string, SSHConnection> = new Map();
+
+/**
+ * Resolve proxy jump configuration from host name
+ */
+function resolveProxyJumpConfig(
+  configLoader: ConfigLoader,
+  proxyHostName: string
+): ProxyJumpConfig | undefined {
+  const proxyHost = configLoader.getHost(proxyHostName);
+  if (!proxyHost) {
+    throw new Error(`Proxy jump host '${proxyHostName}' not found in configuration`);
+  }
+
+  return {
+    hostname: proxyHost.hostname,
+    port: proxyHost.port || 22,
+    user: proxyHost.user,
+    auth: proxyHost.auth,
+  };
+}
+
+/**
+ * Create an SSH connection with proxy jump support
+ */
+function createSSHConnection(
+  configLoader: ConfigLoader,
+  hostName: string,
+  hostConfig: HostConfig
+): SSHConnection {
+  let proxyConfig: ProxyJumpConfig | undefined;
+
+  if (hostConfig.proxy_jump) {
+    proxyConfig = resolveProxyJumpConfig(configLoader, hostConfig.proxy_jump);
+  }
+
+  return new SSHConnection(hostName, hostConfig, proxyConfig);
+}
 
 // Session state (for interactive sessions)
 interface Session {
@@ -704,10 +742,10 @@ async function handleRemoteExecute(
       );
     }
 
-    // Get or create connection
+    // Get or create connection (with proxy jump support)
     let connection = connectionPool.get(hostName);
     if (!connection) {
-      connection = new SSHConnection(hostName, hostConfig);
+      connection = createSSHConnection(configLoader, hostName, hostConfig);
       connectionPool.set(hostName, connection);
     }
 
@@ -770,7 +808,7 @@ async function handleRemoteFileRead(
 
   let connection = connectionPool.get(host);
   if (!connection) {
-    connection = new SSHConnection(host, hostConfig);
+    connection = createSSHConnection(configLoader, host, hostConfig);
     connectionPool.set(host, connection);
   }
 
@@ -848,7 +886,7 @@ async function handleRemoteFileWrite(
 
   let connection = connectionPool.get(host);
   if (!connection) {
-    connection = new SSHConnection(host, hostConfig);
+    connection = createSSHConnection(configLoader, host, hostConfig);
     connectionPool.set(host, connection);
   }
 
@@ -927,7 +965,7 @@ async function handleRemoteFileEdit(
 
   let connection = connectionPool.get(host);
   if (!connection) {
-    connection = new SSHConnection(host, hostConfig);
+    connection = createSSHConnection(configLoader, host, hostConfig);
     connectionPool.set(host, connection);
   }
 
@@ -1036,7 +1074,7 @@ async function handleRemoteUpload(
 
   let connection = connectionPool.get(host);
   if (!connection) {
-    connection = new SSHConnection(host, hostConfig);
+    connection = createSSHConnection(configLoader, host, hostConfig);
     connectionPool.set(host, connection);
   }
 
@@ -1102,7 +1140,7 @@ async function handleRemoteDownload(
 
   let connection = connectionPool.get(host);
   if (!connection) {
-    connection = new SSHConnection(host, hostConfig);
+    connection = createSSHConnection(configLoader, host, hostConfig);
     connectionPool.set(host, connection);
   }
 
@@ -1173,12 +1211,20 @@ async function handleListHosts(configLoader: ConfigLoader) {
       .map(([k, v]) => `${k}=${v}`)
       .join(", ");
 
-    return `${h.name}:
+    let info = `${h.name}:
   Host: ${h.config.hostname}:${h.config.port}
-  User: ${h.config.user}
+  User: ${h.config.user}`;
+
+    if (h.config.proxy_jump) {
+      info += `\n  ProxyJump: ${h.config.proxy_jump}`;
+    }
+
+    info += `
   Status: ${connected ? "connected" : "disconnected"}
   Policy: ${policySummary}
   Labels: ${labels || "(none)"}`;
+
+    return info;
   });
 
   return {
@@ -1198,7 +1244,7 @@ async function handleSessionStart(
     throw new Error(`Unknown host: ${host}`);
   }
 
-  const connection = new SSHConnection(host, hostConfig);
+  const connection = createSSHConnection(configLoader, host, hostConfig);
   await connection.connect();
 
   const sessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1448,7 +1494,7 @@ async function handleRemoteInstallAgent(
     throw new Error(`Unknown host: ${host}. Add it first with remote_add_host or ssh_alias_add.`);
   }
 
-  const connection = new SSHConnection(host, hostConfig);
+  const connection = createSSHConnection(configLoader, host, hostConfig);
 
   const progressLog: string[] = [];
   const result = await installOnRemote(
@@ -1506,7 +1552,7 @@ async function handleRemoteDetectSystem(
     throw new Error(`Unknown host: ${host}`);
   }
 
-  const connection = new SSHConnection(host, hostConfig);
+  const connection = createSSHConnection(configLoader, host, hostConfig);
   await connection.connect();
 
   const os = await detectOS(connection);
