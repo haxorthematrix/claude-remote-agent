@@ -9,6 +9,7 @@ import {
   HostConfig,
   PolicyConfig,
 } from "../types/index.js";
+import { ConfigWatcher, ConfigWatcherOptions, createConfigWatcher } from "./watcher.js";
 
 const DEFAULT_CONFIG_DIR = path.join(os.homedir(), ".config", "claude-remote-agent");
 const CONFIG_FILE = "config.yaml";
@@ -17,6 +18,8 @@ const HOSTS_FILE = "hosts.yaml";
 export class ConfigLoader {
   private configDir: string;
   private config: Config | null = null;
+  private watcher: ConfigWatcher | null = null;
+  private reloadCallbacks: Array<(config: Config) => void> = [];
 
   constructor(configDir?: string) {
     this.configDir = configDir || DEFAULT_CONFIG_DIR;
@@ -181,6 +184,83 @@ export class ConfigLoader {
       fs.writeFileSync(hostsPath, example);
       console.log(`Created ${hostsPath}`);
     }
+  }
+
+  /**
+   * Enable hot-reload: watch config files and reload on changes
+   */
+  enableHotReload(options: ConfigWatcherOptions = {}): void {
+    if (this.watcher) {
+      return; // Already watching
+    }
+
+    this.watcher = createConfigWatcher(
+      this.configDir,
+      async () => {
+        await this.reload();
+      },
+      options
+    );
+
+    this.watcher.start();
+  }
+
+  /**
+   * Disable hot-reload: stop watching config files
+   */
+  disableHotReload(): void {
+    if (this.watcher) {
+      this.watcher.stop();
+      this.watcher = null;
+    }
+  }
+
+  /**
+   * Check if hot-reload is enabled
+   */
+  isHotReloadEnabled(): boolean {
+    return this.watcher?.isWatching() ?? false;
+  }
+
+  /**
+   * Reload configuration from disk
+   */
+  async reload(): Promise<Config> {
+    const oldConfig = this.config;
+    const newConfig = await this.load();
+
+    // Notify callbacks about the reload
+    for (const callback of this.reloadCallbacks) {
+      try {
+        callback(newConfig);
+      } catch (error) {
+        console.error("[claude-remote-agent] Reload callback error:", error);
+      }
+    }
+
+    return newConfig;
+  }
+
+  /**
+   * Register a callback to be called when config is reloaded
+   */
+  onReload(callback: (config: Config) => void): () => void {
+    this.reloadCallbacks.push(callback);
+
+    // Return unsubscribe function
+    return () => {
+      const index = this.reloadCallbacks.indexOf(callback);
+      if (index !== -1) {
+        this.reloadCallbacks.splice(index, 1);
+      }
+    };
+  }
+
+  /**
+   * Get the config directory path
+   */
+  getConfigDir(): string {
+    return this.configDir;
   }
 }
 

@@ -538,6 +538,21 @@ const TOOLS: Tool[] = [
       required: [],
     },
   },
+  {
+    name: "config_reload",
+    description:
+      "Reload configuration from disk. Use this after manually editing config files. Also shows hot-reload status.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        force: {
+          type: "boolean",
+          description: "Force reload even if hot-reload is enabled (default: false)",
+        },
+      },
+      required: [],
+    },
+  },
 ];
 
 export async function createServer(configDir?: string): Promise<Server> {
@@ -554,6 +569,15 @@ export async function createServer(configDir?: string): Promise<Server> {
   if (auditLogger.isEnabled()) {
     console.error(`[claude-remote-agent] Audit logging enabled: ${auditLogger.getLogPath()}`);
   }
+
+  // Enable hot-reload for config changes
+  configLoader.enableHotReload();
+
+  // Register reload callback to reinitialize audit logger if needed
+  configLoader.onReload((newConfig) => {
+    // Reinitialize audit logger with new config
+    initAuditLogger(newConfig.global.audit);
+  });
 
   const server = new Server(
     {
@@ -681,6 +705,11 @@ export async function createServer(configDir?: string): Promise<Server> {
             host?: string;
             tool?: string;
             success_only?: boolean;
+          });
+
+        case "config_reload":
+          return await handleConfigReload(configLoader, toolArgs as unknown as {
+            force?: boolean;
           });
 
         default:
@@ -1789,8 +1818,72 @@ function handleAuditLogQuery(params: {
   };
 }
 
+async function handleConfigReload(
+  configLoader: ConfigLoader,
+  params: { force?: boolean }
+) {
+  const hotReloadEnabled = configLoader.isHotReloadEnabled();
+  const configDir = configLoader.getConfigDir();
+
+  let output = `Configuration Status\n${"=".repeat(40)}\n\n`;
+  output += `Config directory: ${configDir}\n`;
+  output += `Hot-reload: ${hotReloadEnabled ? "enabled (watching for changes)" : "disabled"}\n\n`;
+
+  // Count current hosts
+  const hostsBefore = configLoader.listHosts().length;
+
+  // Reload if forced or if hot-reload is disabled
+  if (params.force || !hotReloadEnabled) {
+    try {
+      await configLoader.reload();
+      const hostsAfter = configLoader.listHosts().length;
+
+      output += `Configuration reloaded successfully!\n`;
+      output += `  Hosts: ${hostsBefore} -> ${hostsAfter}\n`;
+
+      if (hostsAfter !== hostsBefore) {
+        output += `  (${hostsAfter > hostsBefore ? "+" : ""}${hostsAfter - hostsBefore} hosts)\n`;
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      output += `Failed to reload configuration: ${message}\n`;
+      return {
+        content: [{ type: "text", text: output }],
+        isError: true,
+      };
+    }
+  } else {
+    output += `Hot-reload is enabled - config changes are detected automatically.\n`;
+    output += `Use force: true to manually reload anyway.\n`;
+  }
+
+  // Show current config summary
+  const hosts = configLoader.listHosts();
+  const groups = Object.keys(configLoader.getConfig().groups);
+
+  output += `\nCurrent configuration:\n`;
+  output += `  Hosts: ${hosts.length}\n`;
+  output += `  Groups: ${groups.length}\n`;
+
+  if (hosts.length > 0) {
+    output += `\n  Host list: ${hosts.map(h => h.name).join(", ")}\n`;
+  }
+  if (groups.length > 0) {
+    output += `  Group list: ${groups.join(", ")}\n`;
+  }
+
+  return {
+    content: [{ type: "text", text: output }],
+  };
+}
+
 // Cleanup on exit
 process.on("exit", () => {
+  // Disable hot-reload watcher
+  const configLoader = getConfigLoader();
+  configLoader.disableHotReload();
+
+  // Close all connections
   for (const connection of connectionPool.values()) {
     connection.disconnect();
   }
